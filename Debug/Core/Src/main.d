@@ -57,7 +57,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  D:/DSP/Include/dsp/support_functions.h \
  D:/DSP/Include/dsp/quaternion_math_functions.h \
  D:/DSP/Include/dsp/window_functions.h \
- D:/DSP/Include/arm_math_types_f16.h
+ D:/DSP/Include/arm_math_types_f16.h D:/DATN/fdacoefs.h \
+ C:/Program\ Files/MATLAB/R2024b/extern/include/tmwtypes.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
@@ -124,3 +125,5 @@ D:/DSP/Include/dsp/support_functions.h:
 D:/DSP/Include/dsp/quaternion_math_functions.h:
 D:/DSP/Include/dsp/window_functions.h:
 D:/DSP/Include/arm_math_types_f16.h:
+D:/DATN/fdacoefs.h:
+C:/Program\ Files/MATLAB/R2024b/extern/include/tmwtypes.h:
