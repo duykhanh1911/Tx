@@ -23,7 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
 #include "arm_math_types_f16.h"
-#include "fdacoefs.h"
+#include "iir.h"
+#include "stdio.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,17 +34,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// ADC and DAC configuration
-#define ADC_SAMPLE_RATE 96000    // Sampling frequency in Hz
-#define ADC_BUFFER_SIZE 64       // Size of ADC buffer for DMA transfer
-#define SINE_TABLE_SIZE 8      // Size of sine wave lookup table
+#define ADC_SAMPLE_RATE 96000
+#define ADC_BUFFER_SIZE 64
+#define SINE_TABLE_SIZE 8
 #define DAC_BUFFER_SIZE ADC_BUFFER_SIZE
-#define BLOCK_SIZE 32            // Block size for filter processing
-#define NUM_STAGE_IIR 16
+#define BLOCK_SIZE (ADC_BUFFER_SIZE/2)
+#define NUM_STAGE_IIR 3
 #define NUM_STD_COEFFS 5
-#define IIR_ORDER (NUM_STAGE_IIR*2)            // Order of the IIR filter (32 + 1 for index 0)
-#define FIR_ORDER 455
-#define NUM_BLOCKS (DAC_BUFFER_SIZE / BLOCK_SIZE)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,12 +60,12 @@ TIM_HandleTypeDef htim8;
 /* USER CODE BEGIN PV */
 
 // DMA buffers for ADC and DAC
+float32_t print_data=0;
 uint16_t adcBuffer[ADC_BUFFER_SIZE];
-float32_t dacBuffer[DAC_BUFFER_SIZE];
+uint32_t dacBuffer[DAC_BUFFER_SIZE];
 // Signal processing buffers
 float32_t sineTable[SINE_TABLE_SIZE];     // Carrier wave lookup table
 float32_t adcValue[ADC_BUFFER_SIZE];      // ADC samples converted to float
-float32_t modulatedSignalHalf[DAC_BUFFER_SIZE/2];
 float32_t modulatedSignal[DAC_BUFFER_SIZE]; // Buffer for modulated signal
 float32_t *modulatedSignalPtr = &modulatedSignal[0];
 
@@ -77,44 +74,11 @@ float32_t filt_out_BPF[ADC_BUFFER_SIZE];  // Output buffer for filtered signal
 float32_t *filt_out_BPF_ptr = &filt_out_BPF[0];
 
 // IIR filter structure and state variables
-arm_biquad_cascade_df2T_instance_f32 iir_filter_BPF;
-arm_fir_instance_f32 fir_filter_BPF;
-float32_t iir_State_BPF[2*NUM_STAGE_IIR];  // State buffer for IIR filter (2 states per stage)
-float32_t fir_State_BPF[BLOCK_SIZE+FIR_ORDER-1];
-// IIR filter coefficients for bandpass filter
-// Fstop1 : 10000Hz
-// Fpass1 : 10300Hz
-// Fpass2 : 11700Hz
-// Fstop2 : 12000Hz
-// Astop1 = Astop2 = 40dB
-// Apass  = 1dB
-// Denominator coefficients (a) - represents the feedback part of the filter
-static const float32_t a_coeffs[IIR_ORDER] = {
-    1, -23.3433254617316, 270.458923271493, -2068.05077951067, 11711.9227186727,
-    -52280.9402944496, 191203.373802611, -588036.150343295, 1549228.77829786,
-    -3544487.26024351, 7114999.55150585, -12629096.804023, 19940196.4604793,
-    -28131336.186653, 35577251.704648, -40424177.8370125, 41319828.7727523,
-    -38010952.4767753, 31456289.2334764, -23387992.8902516, 15588325.8205582,
-    -9283456.97370102, 4917899.62201564, -2303697.87299914, 946792.887857377,
-    -337917.637907267, 103316.564961882, -26563.5229314584, 5595.49926794879,
-    -929.053986421767, 114.248700906604, -9.27223577617348, 0.37350446875285
-};
-
-// Numerator coefficients (b) - represents the feedforward part of the filter
-static const float32_t b_coeffs[IIR_ORDER] = {
-	5.32193000539747e-22,0,-8.51508800863595e-21,0,6.38631600647696e-20,
-	0,-2.98028080302258e-19,0,9.6859126098234e-19,0,
-	-2.32461902635761e-18,0,4.26180154832229e-18,0,-6.08828792617471e-18,
-	0,6.84932391694654e-18,0,-6.08828792617471e-18,0,4.26180154832229e-18,
-	0,-2.32461902635761e-18,0,9.6859126098234e-19,0,-2.98028080302258e-19,
-	0,6.38631600647696e-20,0,-8.51508800863595e-21,0,5.32193000539747e-22
-
-};
-
-// Combined coefficients array for biquad cascade implementation
-// Format: [b0, b1, b2, a1, a2] for each biquad section
-float32_t iir_coeffs[NUM_STAGE_IIR * NUM_STD_COEFFS];
+filter_iir_t iir_filter;
+float32_t iir_State_BPF[2*NUM_STAGE_IIR];
 float32_t coefficients[NUM_STAGE_IIR * NUM_STD_COEFFS];
+float32_t b[7] = { 0.00284896704954483,0,-0.00854690114863449,0,0.00854690114863449,0,-0.00284896704954483 };
+float32_t a[6] = { -4.21179037467128,8.32172826164948,-9.56398610478042,6.74992484911049,-2.77045239474902,0.534195793129486 };
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,102 +89,61 @@ static void MX_DAC_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
-float32_t dc=1800.0f;
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/**
- * @brief  Callback function for ADC conversion half complete
- * @param  hadc: ADC handle pointer
- * @note   Processes first half of ADC buffer:
- *         1. Converts ADC samples to float
- *         2. Modulates with carrier wave
- *         3. Applies IIR filter
- *         4. Outputs to DAC with DC offset
- */
+
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc){
-	uint32_t sineIndex=0;
+	static uint32_t sineIndex=0;
+	filt_out_BPF[ADC_BUFFER_SIZE/2] = 0;
 	for(uint32_t i=0;i<ADC_BUFFER_SIZE/2;i++){
-		adcValue[i]=((float32_t)adcBuffer[i] - 2048.0f) / 2048.0f;
+		adcValue[i]=(float32_t)((adcBuffer[i]/4095.0f)*3.3f);
 	}
 	for(uint32_t i=0;i<ADC_BUFFER_SIZE/2;i++){
 		modulatedSignal[i]=adcValue[i]*sineTable[sineIndex];
 		sineIndex=(sineIndex+1)%SINE_TABLE_SIZE;
 	}
-	//arm_fir_f32(&fir_filter_BPF, modulatedSignalPtr+BLOCK_SIZE,filt_out_BPF_ptr+BLOCK_SIZE , BLOCK_SIZE);
-	arm_biquad_cascade_df2T_f32(&iir_filter_BPF, modulatedSignalPtr, filt_out_BPF_ptr, BLOCK_SIZE);
-
+	for(uint32_t i=0;i<ADC_BUFFER_SIZE/2;i++){
+		filt_out_BPF[i]=filter_iir_apply(&iir_filter, modulatedSignal[i]);
+	}
+	//arm_biquad_cascade_df2T_f32(&iir_filter_BPF, modulatedSignalPtr, filt_out_BPF_ptr, BLOCK_SIZE);
 	for(int i=0;i<DAC_BUFFER_SIZE/2;i++){
-	    dacBuffer[i] = (uint32_t)(filt_out_BPF[i]*2047+2048);
+	    dacBuffer[i] = (uint32_t)((filt_out_BPF[i]/3.3f)*4095);
 	}
 }
 
-/**
- * @brief  Callback function for ADC conversion complete
- * @param  hadc: ADC handle pointer
- * @note   Processes second half of ADC buffer while DMA fills first half
- */
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
-	uint32_t sineIndex=0;
+	static uint32_t sineIndex=0;
 	for(uint32_t i=ADC_BUFFER_SIZE/2;i<ADC_BUFFER_SIZE;i++){
-		adcValue[i]=((float32_t)adcBuffer[i] - 2048.0f) / 2048.0f;
+		adcValue[i]=(float32_t)((adcBuffer[i]/4095.0f)*3.3f);
 	}
 	for(uint32_t i=ADC_BUFFER_SIZE/2;i<ADC_BUFFER_SIZE;i++){
 		modulatedSignal[i]=adcValue[i]*sineTable[sineIndex];
 		sineIndex=(sineIndex+1)%SINE_TABLE_SIZE;
 	}
-	//arm_fir_f32(&fir_filter_BPF, modulatedSignalPtr+BLOCK_SIZE,filt_out_BPF_ptr+BLOCK_SIZE , BLOCK_SIZE);
-	arm_biquad_cascade_df2T_f32(&iir_filter_BPF, modulatedSignalPtr+BLOCK_SIZE, filt_out_BPF_ptr+BLOCK_SIZE, BLOCK_SIZE);
+	for(uint32_t i=ADC_BUFFER_SIZE/2;i<ADC_BUFFER_SIZE;i++){
+		filt_out_BPF[i]=filter_iir_apply(&iir_filter, modulatedSignal[i]);
+	}
+	//arm_biquad_cascade_df2T_f32(&iir_filter_BPF, modulatedSignalPtr+BLOCK_SIZE, filt_out_BPF_ptr+BLOCK_SIZE, BLOCK_SIZE);
 	for(int i=DAC_BUFFER_SIZE/2;i<DAC_BUFFER_SIZE;i++){
-		dacBuffer[i]=(uint32_t)(filt_out_BPF[i]*2047+2048);
+		dacBuffer[i]=(uint32_t)((filt_out_BPF[i]/3.3f)*4095);
 	}
 }
 
-/**
- * @brief  Generates sine wave lookup table for carrier signal
- * @note   Creates one complete cycle of sine wave with SINE_TABLE_SIZE points
- */
 void GenerateSineWave(void){
 	for(int i=0; i<SINE_TABLE_SIZE;i++){
-		sineTable[i]=arm_sin_f32(2.0f*PI*i/SINE_TABLE_SIZE);
+		sineTable[i]=arm_sin_f32(2.0f*PI*i/SINE_TABLE_SIZE)*1.65+1.65;
 	}
 }
 
-/**
- * @brief  Initializes the IIR filter
- * @note   Converts filter coefficients to biquad cascade form
- *         Each biquad section requires 5 coefficients: b0, b1, b2, a1, a2
- *         The filter is implemented as a cascade of second-order sections
- *         Direct Form II Transposed structure is used for better numerical stability
- */
 void InitializeIIRFilter(void) {
-    // Convert coefficients to biquad cascade form
-     for(int i = 0; i < NUM_STAGE_IIR; i++) {
-        // Get coefficients for this biquad section
-        float32_t b0 = b_coeffs[i*2];
-        float32_t b1 = b_coeffs[i*2 + 1];
-        float32_t b2 = b_coeffs[i*2 + 2];
-        float32_t a1 = a_coeffs[i*2 + 1];
-        float32_t a2 = a_coeffs[i*2 + 2];
-        
-        // Normalize coefficients by a0 (which is 1)
-        iir_coeffs[i*5] = b0;      // b0
-        iir_coeffs[i*5 + 1] = b1;  // b1
-        iir_coeffs[i*5 + 2] = b2;  // b2
-        iir_coeffs[i*5 + 3] = -a1; // -a1 (negative for Direct Form II Transposed)
-        iir_coeffs[i*5 + 4] = -a2; // -a2 (negative for Direct Form II Transposed)
-    }
-     for (int i = 0; i < 16; i++) {
-         coefficients[i * 5 + 0] =  NUM[i * 2][0] * NUM[i * 2 + 1][0];
-         coefficients[i * 5 + 1] =  NUM[i * 2][0] * NUM[i * 2 + 1][1];
-         coefficients[i * 5 + 2] =  NUM[i * 2][0] * NUM[i * 2 + 1][2];
-         coefficients[i * 5 + 3] = -DEN[i * 2][0] * DEN[i * 2 + 1][1];
-         coefficients[i * 5 + 4] = -DEN[i * 2][0] * DEN[i * 2 + 1][2];
-     }
     // Initialize the IIR filter structure
-    arm_biquad_cascade_df2T_init_f32(&iir_filter_BPF, NUM_STAGE_IIR, coefficients, iir_State_BPF);
-    //arm_biquad_cascade_df2T_init_f32(&iir_filter_BPF, NUM_STAGE_IIR, iir_coeffs, iir_State_BPF);
+    //arm_biquad_cascade_df2T_init_f32(&iir_filter_BPF, NUM_STAGE_IIR, coeffs, iir_State_BPF);
+    float32_t buffer[64] = {0};
+    filter_iir_init(&iir_filter, b, a, 6, buffer);
 }
 /* USER CODE END 0 */
 
@@ -259,16 +182,17 @@ int main(void)
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
   GenerateSineWave();
-  //arm_fir_init_f32(&fir_filter_BPF, FIR_ORDER, &fir_Coeffs[0], &fir_State_BPF[0], BLOCK_SIZE);
   InitializeIIRFilter();
+
   HAL_TIM_Base_Start(&htim8);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&adcBuffer, ADC_BUFFER_SIZE);
-  if(HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*)&dacBuffer, DAC_BUFFER_SIZE, DAC_ALIGN_12B_R)!=HAL_OK){
+  if(HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (const uint32_t*)&dacBuffer, DAC_BUFFER_SIZE, DAC_ALIGN_12B_R)!=HAL_OK){
 	  Error_Handler();
 
   };
-
+  HAL_TIM_Base_Start(&htim8);
   /* USER CODE END 2 */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
@@ -351,8 +275,8 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ScanConvMode = DISABLE;
   hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T8_TRGO;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DMAContinuousRequests = ENABLE;
@@ -436,9 +360,9 @@ static void MX_TIM8_Init(void)
 
   /* USER CODE END TIM8_Init 1 */
   htim8.Instance = TIM8;
-  htim8.Init.Prescaler = 1000-1;
+  htim8.Init.Prescaler = 100-1;
   htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim8.Init.Period = 1-1;
+  htim8.Init.Period = 10-1;
   htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim8.Init.RepetitionCounter = 0;
   htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
